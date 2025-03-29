@@ -28,11 +28,12 @@ def extract_currency(amount_str):
 
 def process_binance_csv(df):
     """Process Binance CSV files to extract trading information"""
-    # Filter completed transactions and clean up data
+    # Filter completed transactions only
     df = df[df['Status'] == 'FILLED'].copy()
 
-    # Convert date string to datetime
+    # Convert date string to datetime and ensure chronological order
     df['Date'] = pd.to_datetime(df['Date(UTC)'])
+    df = df.sort_values('Date')  # Ensure chronological order
     df['Year'] = df['Date'].dt.year
     df['Month'] = df['Date'].dt.month
 
@@ -40,16 +41,12 @@ def process_binance_csv(df):
     df['Amount'] = df['Executed'].apply(extract_crypto_amount)
     df['Currency'] = df['Executed'].apply(extract_currency)
 
-    # Extract pair information
-    df['Base Currency'] = df['Pair'].str.replace('BUSD', '').str.replace('EUR', '')
+    # Extract pair information (keep the full pair)
+    df['Trading Pair'] = df['Pair']
 
     # Calculate total in BUSD
-    # Extract amount and quote currency from Trading total
     df['Total Amount'] = df['Trading total'].apply(extract_crypto_amount)
     df['Quote Currency'] = df['Trading total'].apply(extract_currency)
-
-    # For consistency, we'll work with BUSD as our base currency
-    # In a more advanced version, we could add currency conversion
     df['Total BUSD'] = df['Total Amount']
 
     # Mark BUY/SELL transactions
@@ -57,76 +54,143 @@ def process_binance_csv(df):
 
     return df
 
-def generate_summary(processed_df):
-    """Generate a summary of all transactions by coin"""
-    # Group by currency and operation
-    buy_df = processed_df[processed_df['Operation'] == 'BUY']
-    sell_df = processed_df[processed_df['Operation'] == 'SELL']
+def calculate_pair_holdings_and_pl(processed_df):
+    """Calculate holdings and profit/loss for each trading pair in chronological order"""
+    # Get unique trading pairs
+    pairs = processed_df['Trading Pair'].unique()
 
-    # Calculate totals for each coin
-    buy_totals = buy_df.groupby('Currency').agg({
-        'Amount': 'sum',
-        'Total BUSD': 'sum'
-    })
+    pair_results = []
 
-    sell_totals = sell_df.groupby('Currency').agg({
-        'Amount': 'sum',
-        'Total BUSD': 'sum'
-    })
+    for pair in pairs:
+        # Get transactions for this pair in chronological order
+        pair_df = processed_df[processed_df['Trading Pair'] == pair].sort_values('Date')
 
-    # Combine into a summary dataframe
-    all_currencies = set(buy_totals.index) | set(sell_totals.index)
-    summary_data = []
+        # Initialize tracking variables
+        running_base_amount = 0  # Amount of the base cryptocurrency
+        running_cost_basis = 0   # Total cost basis in BUSD
+        running_proceeds = 0     # Total proceeds from sales in BUSD
+        realized_pl = 0          # Realized profit/loss
 
-    for currency in all_currencies:
-        buy_amount = buy_totals.loc[currency, 'Amount'] if currency in buy_totals.index else 0
-        buy_value = buy_totals.loc[currency, 'Total BUSD'] if currency in buy_totals.index else 0
-        sell_amount = sell_totals.loc[currency, 'Amount'] if currency in sell_totals.index else 0
-        sell_value = sell_totals.loc[currency, 'Total BUSD'] if currency in sell_totals.index else 0
+        # Keep track of all transactions for this pair
+        pair_transactions = []
 
-        # Calculate profit/loss
-        net_amount = buy_amount - sell_amount
-        profit_loss = sell_value - buy_value
+        # Process each transaction chronologically
+        for idx, row in pair_df.iterrows():
+            operation = row['Operation']
+            amount = row['Amount']
+            total_busd = row['Total BUSD']
+            currency = row['Currency']
+            date = row['Date']
 
-        avg_buy_price = buy_value / buy_amount if buy_amount > 0 else 0
-        avg_sell_price = sell_value / sell_amount if sell_amount > 0 else 0
+            # Record transaction
+            transaction = {
+                'Date': date,
+                'Pair': pair,
+                'Operation': operation,
+                'Amount': amount,
+                'Currency': currency,
+                'Total BUSD': total_busd
+            }
 
-        summary_data.append({
-            'Currency': currency,
-            'Total Bought': buy_amount,
-            'Avg Buy Price': avg_buy_price,
-            'Total Buy Value': buy_value,
-            'Total Sold': sell_amount,
-            'Avg Sell Price': avg_sell_price,
-            'Total Sell Value': sell_value,
-            'Net Position': net_amount,
-            'Profit/Loss': profit_loss
-        })
+            # Update running totals
+            if operation == 'BUY':
+                # Buying increases our holdings and cost basis
+                running_base_amount += amount
+                running_cost_basis += total_busd
+                transaction['Running Holdings'] = running_base_amount
+                transaction['Cost Basis'] = running_cost_basis
+                transaction['Avg Cost'] = running_cost_basis / running_base_amount if running_base_amount > 0 else 0
+                transaction['Realized P/L'] = 0
 
-    summary_df = pd.DataFrame(summary_data)
-    return summary_df
+            elif operation == 'SELL':
+                # Calculate profit/loss for this sale
+                if running_base_amount > 0:
+                    # Calculate average cost for the amount being sold
+                    avg_cost_per_unit = running_cost_basis / running_base_amount
+                    cost_of_units_sold = amount * avg_cost_per_unit
 
-def generate_yearly_summary(processed_df):
+                    # Update running totals
+                    running_base_amount -= amount
+
+                    # If we're selling more than we have, cap it at zero
+                    if running_base_amount < 0:
+                        running_base_amount = 0
+
+                    # Proportionally reduce the cost basis
+                    if amount > 0:
+                        running_cost_basis = running_cost_basis * (running_base_amount / (running_base_amount + amount))
+
+                    # Calculate profit/loss
+                    transaction_pl = total_busd - cost_of_units_sold
+                    realized_pl += transaction_pl
+                    running_proceeds += total_busd
+
+                    transaction['Running Holdings'] = running_base_amount
+                    transaction['Cost Basis'] = running_cost_basis
+                    transaction['Avg Cost'] = running_cost_basis / running_base_amount if running_base_amount > 0 else 0
+                    transaction['Realized P/L'] = transaction_pl
+                else:
+                    # We're selling but don't have any holdings (possible in some cases)
+                    transaction['Running Holdings'] = 0
+                    transaction['Cost Basis'] = 0
+                    transaction['Avg Cost'] = 0
+                    transaction['Realized P/L'] = 0
+                    running_proceeds += total_busd
+
+            pair_transactions.append(transaction)
+
+        # Calculate final unrealized P/L based on current holdings
+        unrealized_pl = 0  # We would need current market prices to calculate this
+
+        # Calculate metrics for this pair
+        pair_summary = {
+            'Trading Pair': pair,
+            'Current Holdings': running_base_amount,
+            'Cost Basis': running_cost_basis,
+            'Average Cost': running_cost_basis / running_base_amount if running_base_amount > 0 else 0,
+            'Total Invested': sum(t['Total BUSD'] for t in pair_transactions if t['Operation'] == 'BUY'),
+            'Total Proceeds': sum(t['Total BUSD'] for t in pair_transactions if t['Operation'] == 'SELL'),
+            'Realized P/L': realized_pl,
+            'Unrealized P/L': unrealized_pl,
+            'Total P/L': realized_pl + unrealized_pl,
+            'Transactions': pair_transactions
+        }
+
+        pair_results.append(pair_summary)
+
+    return pair_results
+
+def generate_yearly_summary(pair_results):
     """Generate a summary of transactions by year"""
-    yearly_data = []
+    yearly_data = {}
 
-    for year, year_df in processed_df.groupby('Year'):
+    # Extract all transactions from all pairs
+    all_transactions = []
+    for pair_result in pair_results:
+        all_transactions.extend(pair_result['Transactions'])
+
+    # Convert to DataFrame for easier grouping
+    transactions_df = pd.DataFrame(all_transactions)
+    transactions_df['Year'] = pd.to_datetime(transactions_df['Date']).dt.year
+
+    # Group by year
+    for year, year_df in transactions_df.groupby('Year'):
         buy_df = year_df[year_df['Operation'] == 'BUY']
         sell_df = year_df[year_df['Operation'] == 'SELL']
 
         total_buy = buy_df['Total BUSD'].sum()
         total_sell = sell_df['Total BUSD'].sum()
-        profit_loss = total_sell - total_buy
+        realized_pl = sell_df['Realized P/L'].sum()
 
-        yearly_data.append({
+        yearly_data[year] = {
             'Year': year,
             'Total Buy Value': total_buy,
             'Total Sell Value': total_sell,
-            'Profit/Loss': profit_loss
-        })
+            'Realized P/L': realized_pl
+        }
 
-    yearly_df = pd.DataFrame(yearly_data)
-    return yearly_df
+    yearly_summary = pd.DataFrame(list(yearly_data.values()))
+    return yearly_summary
 
 def get_download_link(df, filename):
     """Create a download link for a dataframe"""
@@ -185,68 +249,91 @@ def main():
         with st.spinner("Processing data..."):
             processed_df = process_binance_csv(combined_df)
 
+            # Calculate pair holdings and profit/loss
+            pair_results = calculate_pair_holdings_and_pl(processed_df)
+
+            # Create summary dataframe for all pairs
+            pair_summary_data = []
+            for result in pair_results:
+                summary_row = {k: v for k, v in result.items() if k != 'Transactions'}
+                pair_summary_data.append(summary_row)
+
+            pair_summary_df = pd.DataFrame(pair_summary_data)
+
             # Show raw data sample
             st.subheader("Raw Transaction Data Sample")
             st.dataframe(processed_df.head())
 
-            # Overall Summary
-            summary_df = generate_summary(processed_df)
-
-            st.subheader("Summary by Currency")
-            st.dataframe(summary_df.sort_values('Currency'))
+            # Overall Summary by Trading Pair
+            st.subheader("Summary by Trading Pair")
+            st.dataframe(pair_summary_df.sort_values('Trading Pair'))
 
             # Yearly Summary
-            yearly_summary = generate_yearly_summary(processed_df)
+            yearly_summary = generate_yearly_summary(pair_results)
 
             st.subheader("Yearly Summary")
             st.dataframe(yearly_summary.sort_values('Year'))
 
-            # Currency selection for detailed view
-            st.subheader("Detailed View by Currency")
-            available_currencies = sorted(processed_df['Currency'].unique())
+            # Trading Pair selection for detailed view
+            st.subheader("Detailed View by Trading Pair")
+            available_pairs = sorted(processed_df['Trading Pair'].unique())
 
-            selected_currency = st.selectbox(
-                "Select a currency to view details",
-                available_currencies
+            selected_pair = st.selectbox(
+                "Select a trading pair to view details",
+                available_pairs
             )
 
-            if selected_currency:
-                currency_data = processed_df[processed_df['Currency'] == selected_currency]
-                st.dataframe(currency_data.sort_values('Date', ascending=False))
+            if selected_pair:
+                # Find the selected pair data
+                pair_data = next((p for p in pair_results if p['Trading Pair'] == selected_pair), None)
 
-                # Simple chart
-                st.subheader(f"Buy/Sell History for {selected_currency}")
+                if pair_data:
+                    # Show pair metrics
+                    st.subheader(f"Metrics for {selected_pair}")
+                    metrics_data = {k: v for k, v in pair_data.items() if k != 'Transactions'}
+                    st.json(metrics_data)
 
-                # Group by month and operation
-                chart_data = currency_data.groupby(['Year', 'Month', 'Operation']).agg({
-                    'Total BUSD': 'sum'
-                }).reset_index()
+                    # Show transactions
+                    st.subheader(f"Transactions for {selected_pair}")
+                    transactions_df = pd.DataFrame(pair_data['Transactions'])
+                    st.dataframe(transactions_df.sort_values('Date', ascending=False))
 
-                # Create date field for chart
-                chart_data['Date'] = chart_data.apply(
-                    lambda row: datetime(int(row['Year']), int(row['Month']), 1),
-                    axis=1
-                )
+                    # Create a chart of running holdings
+                    st.subheader(f"Holdings History for {selected_pair}")
+                    holdings_data = transactions_df[['Date', 'Running Holdings']]
+                    holdings_data = holdings_data.set_index('Date')
+                    st.line_chart(holdings_data)
 
-                # Pivot for chart
-                pivot_data = chart_data.pivot(
-                    index='Date',
-                    columns='Operation',
-                    values='Total BUSD'
-                ).fillna(0)
-
-                st.line_chart(pivot_data)
+                    # Create a chart of P/L
+                    st.subheader(f"Cumulative P/L for {selected_pair}")
+                    transactions_df['Cumulative P/L'] = transactions_df['Realized P/L'].cumsum()
+                    pl_data = transactions_df[['Date', 'Cumulative P/L']]
+                    pl_data = pl_data.set_index('Date')
+                    st.line_chart(pl_data)
 
             # Download options
             st.subheader("Download Reports")
 
             col1, col2, col3 = st.columns(3)
+
+            # Convert pair_summary_df for download
             with col1:
-                st.markdown(get_download_link(summary_df, "crypto_tax_summary.csv"), unsafe_allow_html=True)
+                st.markdown(get_download_link(pair_summary_df, "crypto_pair_summary.csv"), unsafe_allow_html=True)
             with col2:
                 st.markdown(get_download_link(yearly_summary, "crypto_tax_yearly.csv"), unsafe_allow_html=True)
+
+            # Create transactions dataframe for download
+            all_transactions = []
+            for pair_result in pair_results:
+                for transaction in pair_result['Transactions']:
+                    transaction_copy = transaction.copy()
+                    transaction_copy['Trading Pair'] = pair_result['Trading Pair']
+                    all_transactions.append(transaction_copy)
+
+            all_transactions_df = pd.DataFrame(all_transactions)
+
             with col3:
-                st.markdown(get_download_link(processed_df, "crypto_tax_detailed.csv"), unsafe_allow_html=True)
+                st.markdown(get_download_link(all_transactions_df, "crypto_tax_detailed.csv"), unsafe_allow_html=True)
     else:
         st.info("Please upload Binance CSV files or select files from the data folder to generate a report.")
 
@@ -258,8 +345,15 @@ def main():
         ## How to use:
         1. Export your transaction history from Binance as CSV
         2. Upload the CSV file(s) here or use the sample data
-        3. View the summary and detailed reports
+        3. View the summary and detailed reports by trading pair
         4. Download the reports for your tax filing
+
+        ## Features:
+        - Analyzes trading pairs instead of individual cryptocurrencies
+        - Calculates accurate profit/loss by processing transactions chronologically
+        - Tracks running holdings for each pair
+        - Shows only filled orders (ignores canceled orders)
+        - Generates yearly summaries for tax reporting
 
         Note: This app assumes that your CSV files follow the Binance export format.
         """)
