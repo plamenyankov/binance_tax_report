@@ -81,10 +81,12 @@ def calculate_pair_holdings_and_pl(processed_df):
             total_busd = row['Total BUSD']
             currency = row['Currency']
             date = row['Date']
+            year = row['Year']
 
             # Record transaction
             transaction = {
                 'Date': date,
+                'Year': year,
                 'Pair': pair,
                 'Operation': operation,
                 'Amount': amount,
@@ -192,6 +194,65 @@ def generate_yearly_summary(pair_results):
     yearly_summary = pd.DataFrame(list(yearly_data.values()))
     return yearly_summary
 
+def generate_yearly_pair_summary(pair_results):
+    """Generate a summary of transactions by year and trading pair"""
+    # Extract all transactions from all pairs
+    all_transactions = []
+    for pair_result in pair_results:
+        pair = pair_result['Trading Pair']
+        for transaction in pair_result['Transactions']:
+            transaction_copy = transaction.copy()
+            transaction_copy['Trading Pair'] = pair
+            all_transactions.append(transaction_copy)
+
+    # Convert to DataFrame for easier grouping
+    transactions_df = pd.DataFrame(all_transactions)
+
+    # Make sure Year is present (should be added during transaction processing)
+    if 'Year' not in transactions_df.columns:
+        transactions_df['Year'] = pd.to_datetime(transactions_df['Date']).dt.year
+
+    # Group by year and trading pair
+    yearly_pair_data = []
+
+    for (year, pair), group_df in transactions_df.groupby(['Year', 'Trading Pair']):
+        buy_df = group_df[group_df['Operation'] == 'BUY']
+        sell_df = group_df[group_df['Operation'] == 'SELL']
+
+        # Calculate yearly metrics for this pair
+        total_buy_amount = buy_df['Amount'].sum()
+        total_sell_amount = sell_df['Amount'].sum()
+        total_buy_value = buy_df['Total BUSD'].sum()
+        total_sell_value = sell_df['Total BUSD'].sum()
+        realized_pl = sell_df['Realized P/L'].sum()
+
+        # Calculate average buy price for the year
+        avg_buy_price = total_buy_value / total_buy_amount if total_buy_amount > 0 else 0
+
+        # Get end-of-year holdings and average cost
+        # We'll use the latest transaction for this pair in this year
+        latest_transaction = group_df.sort_values('Date').iloc[-1] if not group_df.empty else None
+
+        eoy_holdings = latest_transaction['Running Holdings'] if latest_transaction is not None else 0
+        eoy_avg_cost = latest_transaction['Avg Cost'] if latest_transaction is not None else 0
+
+        yearly_pair_data.append({
+            'Year': year,
+            'Trading Pair': pair,
+            'Total Buy Amount': total_buy_amount,
+            'Total Sell Amount': total_sell_amount,
+            'Total Buy Value': total_buy_value,
+            'Total Sell Value': total_sell_value,
+            'Realized P/L': realized_pl,
+            'Avg Buy Price': avg_buy_price,
+            'EOY Holdings': eoy_holdings,
+            'EOY Avg Cost': eoy_avg_cost,
+            'Base Currency': group_df['Currency'].iloc[0] if not group_df.empty else '',
+        })
+
+    yearly_pair_df = pd.DataFrame(yearly_pair_data)
+    return yearly_pair_df
+
 def get_download_link(df, filename):
     """Create a download link for a dataframe"""
     csv = df.to_csv(index=False)
@@ -274,6 +335,30 @@ def main():
             st.subheader("Yearly Summary")
             st.dataframe(yearly_summary.sort_values('Year'))
 
+            # Generate and show the combined yearly pair summary
+            yearly_pair_summary = generate_yearly_pair_summary(pair_results)
+
+            st.subheader("Trading Pair Performance by Year")
+
+            # Add year filter
+            available_years = sorted(yearly_pair_summary['Year'].unique())
+            selected_year = st.selectbox(
+                "Filter by Year",
+                ["All Years"] + [str(year) for year in available_years]
+            )
+
+            # Filter by selected year
+            if selected_year != "All Years":
+                filtered_summary = yearly_pair_summary[yearly_pair_summary['Year'] == int(selected_year)]
+            else:
+                filtered_summary = yearly_pair_summary
+
+            # Display the filtered table
+            st.dataframe(filtered_summary.sort_values(['Year', 'Trading Pair']))
+
+            # Download link for the yearly pair summary
+            st.markdown(get_download_link(yearly_pair_summary, "crypto_yearly_pair_summary.csv"), unsafe_allow_html=True)
+
             # Trading Pair selection for detailed view
             st.subheader("Detailed View by Trading Pair")
             available_pairs = sorted(processed_df['Trading Pair'].unique())
@@ -314,13 +399,15 @@ def main():
             # Download options
             st.subheader("Download Reports")
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
             # Convert pair_summary_df for download
             with col1:
                 st.markdown(get_download_link(pair_summary_df, "crypto_pair_summary.csv"), unsafe_allow_html=True)
             with col2:
                 st.markdown(get_download_link(yearly_summary, "crypto_tax_yearly.csv"), unsafe_allow_html=True)
+            with col3:
+                st.markdown(get_download_link(yearly_pair_summary, "crypto_yearly_pair_summary.csv"), unsafe_allow_html=True)
 
             # Create transactions dataframe for download
             all_transactions = []
@@ -332,7 +419,7 @@ def main():
 
             all_transactions_df = pd.DataFrame(all_transactions)
 
-            with col3:
+            with col4:
                 st.markdown(get_download_link(all_transactions_df, "crypto_tax_detailed.csv"), unsafe_allow_html=True)
     else:
         st.info("Please upload Binance CSV files or select files from the data folder to generate a report.")
@@ -354,6 +441,8 @@ def main():
         - Tracks running holdings for each pair
         - Shows only filled orders (ignores canceled orders)
         - Generates yearly summaries for tax reporting
+        - Provides yearly performance breakdown by trading pair
+        - Tracks holdings across years for accurate profit/loss calculations
 
         Note: This app assumes that your CSV files follow the Binance export format.
         """)
