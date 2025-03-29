@@ -594,7 +594,8 @@ def main():
     # File uploader or use sample data
     data_option = st.radio(
         "Choose data source",
-        ["Upload your own CSV file(s)", "Use sample data from data folder"]
+        ["Use sample data from data folder", "Upload your own CSV file(s)"],
+        index=0  # Set the first option (sample data) as default
     )
 
     all_data = []
